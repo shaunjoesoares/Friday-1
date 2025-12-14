@@ -13,7 +13,7 @@ import json
 # Force UTF-8 encoding for stdout to handle emojis
 # sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-from config import GEMINI_API_KEY
+from config import GEMINI_API_KEY, GEMINI_API_KEYS
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -34,16 +34,36 @@ SCOPES = [
 ]
 
 class GeminiRESTClient:
-    """REST API client for Gemini (fixes Python 3.14 gRPC issues)"""
-    def __init__(self, api_key: str, model_name: str = "gemini-flash-latest"):
-        self.api_key = api_key
+    """REST API client for Gemini with automatic API key rotation"""
+    def __init__(self, api_keys: list, model_name: str = "gemini-2.5-flash"):
+        # Support both single key (string) and multiple keys (list)
+        if isinstance(api_keys, str):
+            self.api_keys = [api_keys]
+        else:
+            self.api_keys = api_keys
+        
+        self.current_key_index = 0
         self.model_name = model_name
         self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
     
+    def _get_current_key(self):
+        """Get the current API key"""
+        return self.api_keys[self.current_key_index]
+    
+    def _rotate_key(self):
+        """Switch to the next API key"""
+        if self.current_key_index < len(self.api_keys) - 1:
+            self.current_key_index += 1
+            print(f"[KEY ROTATION] Switching to API key #{self.current_key_index + 1}", flush=True)
+            return True
+        else:
+            print(f"[ERROR] All {len(self.api_keys)} API keys exhausted!", flush=True)
+            return False
+    
     def generate_content(self, prompt: str):
-        """Generate content using REST API instead of gRPC"""
-        max_retries = 3
-        print(f"[DEBUG] Generating content via REST API...", flush=True)
+        """Generate content using REST API with automatic key rotation"""
+        max_retries = 5  # Increased from 3 to handle server overload
+        print(f"[DEBUG] Generating content via REST API (Key #{self.current_key_index + 1})...", flush=True)
         
         for attempt in range(max_retries):
             try:
@@ -57,7 +77,7 @@ class GeminiRESTClient:
                 }
                 
                 response = requests.post(
-                    f"{self.base_url}?key={self.api_key}",
+                    f"{self.base_url}?key={self._get_current_key()}",
                     headers=headers,
                     json=payload,
                     timeout=30
@@ -75,12 +95,34 @@ class GeminiRESTClient:
                             self.text = txt
                     
                     return Response(text)
+                    
                 elif response.status_code == 429:
+                    # Check if it's a quota exhaustion error
+                    error_text = response.text
+                    if "quota" in error_text.lower() or "RESOURCE_EXHAUSTED" in error_text:
+                        print(f"[WARN] API Key #{self.current_key_index + 1} quota exhausted!", flush=True)
+                        # Try to rotate to next key
+                        if self._rotate_key():
+                            print("[INFO] Retrying with new API key...", flush=True)
+                            continue  # Retry immediately with new key
+                        else:
+                            raise Exception(f"All API keys exhausted: {response.text}")
+                    else:
+                        # Regular rate limit, wait and retry
+                        if attempt < max_retries - 1:
+                            wait_time = 10
+                            print(f"[WARN] Rate limit hit. Retrying in {wait_time} seconds... (Attempt {attempt+1}/{max_retries})", flush=True)
+                            time.sleep(wait_time)
+                            continue
+                        raise Exception(f"Rate limit exceeded: {response.text}")
+                        
+                elif response.status_code == 503:
                     if attempt < max_retries - 1:
-                        print(f"[WARN] Rate limit hit. Retrying in 10 seconds... (Attempt {attempt+1}/{max_retries})", flush=True)
-                        time.sleep(10)
+                        wait_time = 10 * (attempt + 1)  # Longer backoff: 10s, 20s, 30s, 40s, 50s
+                        print(f"[WARN] Model overloaded (503). Retrying in {wait_time} seconds... (Attempt {attempt+1}/{max_retries})", flush=True)
+                        time.sleep(wait_time)
                         continue
-                    raise Exception(f"Rate limit exceeded: {response.text}")
+                    raise Exception(f"Model overloaded after {max_retries} attempts: {response.text}")
                 else:
                     raise Exception(f"API Error {response.status_code}: {response.text}")
                     
@@ -103,8 +145,8 @@ class GoogleWorkspaceAgent:
         self.drive_service = build('drive', 'v3', credentials=self.creds)
         self.calendar_service = build('calendar', 'v3', credentials=self.creds)
         
-        # Initialize Gemini REST API client (Python 3.14 compatible)
-        self.model = GeminiRESTClient(GEMINI_API_KEY, "gemini-flash-latest")
+        # Initialize Gemini REST API client with multiple keys for rotation
+        self.model = GeminiRESTClient(GEMINI_API_KEYS, "gemini-2.5-flash")
         self.chat_history = []
         
         # Initialize specialized agents
