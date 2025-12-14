@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+credentials.json
+token.pickle
+.env
+.venv
+env/
+venv/
+.DS_Store
+.vscode/
+.idea/
+
+# Sensitive Data
+config.py
+API keys.txt
+*.backup
+test_*.py
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
